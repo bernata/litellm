@@ -27,12 +27,18 @@ import litellm
 from litellm._logging import verbose_logger
 from litellm._uuid import uuid
 from litellm.integrations.custom_batch_logger import CustomBatchLogger
+from litellm.integrations.datadog.datadog_mock_client import (
+    should_use_datadog_mock,
+    create_mock_datadog_client,
+)
 from litellm.integrations.datadog.datadog_handler import (
     get_datadog_hostname,
     get_datadog_service,
     get_datadog_source,
     get_datadog_tags,
+    get_datadog_base_url_from_env,
 )
+from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
     get_async_httpx_client,
@@ -79,6 +85,12 @@ class DataDogLogger(
         """
         try:
             verbose_logger.debug("Datadog: in init datadog logger")
+            
+            self.is_mock_mode = should_use_datadog_mock()
+            
+            if self.is_mock_mode:
+                create_mock_datadog_client()
+                verbose_logger.debug("[DATADOG MOCK] Datadog logger initialized in mock mode")
 
             #########################################################
             # Handle datadog_params set as litellm.datadog_params
@@ -99,7 +111,9 @@ class DataDogLogger(
                 self._configure_dd_direct_api()
 
             # Optional override for testing
-            self._apply_dd_base_url_override()
+            dd_base_url = get_datadog_base_url_from_env()
+            if dd_base_url:
+                self.intake_url = f"{dd_base_url}/api/v2/logs"
             self.sync_client = _get_httpx_client()
             asyncio.create_task(self.periodic_flush())
             self.flush_lock = asyncio.Lock()
@@ -157,18 +171,6 @@ class DataDogLogger(
 
         self.DD_API_KEY = os.getenv("DD_API_KEY")
         self.intake_url = f"https://http-intake.logs.{os.getenv('DD_SITE')}/api/v2/logs"
-
-    def _apply_dd_base_url_override(self) -> None:
-        """
-        Apply base URL override for testing purposes
-        """
-        dd_base_url: Optional[str] = (
-            os.getenv("_DATADOG_BASE_URL")
-            or os.getenv("DATADOG_BASE_URL")
-            or os.getenv("DD_BASE_URL")
-        )
-        if dd_base_url is not None:
-            self.intake_url = f"{dd_base_url}/api/v2/logs"
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         """
@@ -228,6 +230,9 @@ class DataDogLogger(
                 len(self.log_queue),
                 self.intake_url,
             )
+            
+            if self.is_mock_mode:
+                verbose_logger.debug("[DATADOG MOCK] Mock mode enabled - API calls will be intercepted")
 
             response = await self.async_send_compressed_data(self.log_queue)
             if response.status_code == 413:
@@ -240,11 +245,16 @@ class DataDogLogger(
                     f"Response from datadog API status_code: {response.status_code}, text: {response.text}"
                 )
 
-            verbose_logger.debug(
-                "Datadog: Response from datadog API status_code: %s, text: %s",
-                response.status_code,
-                response.text,
-            )
+            if self.is_mock_mode:
+                verbose_logger.debug(
+                    f"[DATADOG MOCK] Batch of {len(self.log_queue)} events successfully mocked"
+                )
+            else:
+                verbose_logger.debug(
+                    "Datadog: Response from datadog API status_code: %s, text: %s",
+                    response.status_code,
+                    response.text,
+                )
         except Exception as e:
             verbose_logger.exception(
                 f"Datadog Error sending batch API - {str(e)}\n{traceback.format_exc()}"
@@ -337,6 +347,7 @@ class DataDogLogger(
             service=get_datadog_service(),
             status=status,
         )
+        self._add_trace_context_to_payload(dd_payload=dd_payload)
         return dd_payload
 
     def create_datadog_logging_payload(
@@ -573,6 +584,56 @@ class DataDogLogger(
             status=DataDogStatus.INFO,
         )
         return dd_payload
+
+    def _add_trace_context_to_payload(
+        self,
+        dd_payload: DatadogPayload,
+    ) -> None:
+        """Attach Datadog APM trace context if one is active."""
+
+        try:
+            trace_context = self._get_active_trace_context()
+            if trace_context is None:
+                return
+
+            dd_payload["dd.trace_id"] = trace_context["trace_id"]
+            span_id = trace_context.get("span_id")
+            if span_id is not None:
+                dd_payload["dd.span_id"] = span_id
+        except Exception:
+            verbose_logger.exception(
+                "Datadog: Failed to attach trace context to payload"
+            )
+
+    def _get_active_trace_context(self) -> Optional[Dict[str, str]]:
+        try:
+            current_span = None
+            current_span_fn = getattr(tracer, "current_span", None)
+            if callable(current_span_fn):
+                current_span = current_span_fn()
+
+            if current_span is None:
+                current_root_span_fn = getattr(tracer, "current_root_span", None)
+                if callable(current_root_span_fn):
+                    current_span = current_root_span_fn()
+
+            if current_span is None:
+                return None
+
+            trace_id = getattr(current_span, "trace_id", None)
+            if trace_id is None:
+                return None
+
+            span_id = getattr(current_span, "span_id", None)
+            trace_context: Dict[str, str] = {"trace_id": str(trace_id)}
+            if span_id is not None:
+                trace_context["span_id"] = str(span_id)
+            return trace_context
+        except Exception:
+            verbose_logger.exception(
+                "Datadog: Failed to retrieve active trace context from tracer"
+            )
+            return None
 
     async def async_health_check(self) -> IntegrationHealthCheckStatus:
         """
